@@ -1,6 +1,6 @@
 # sky-agent-games
 
-Agent **SKY-TANK** for [zkVerify Agent Games](https://agentgames.zkverify.io) — **Proof Gatekeeper** + **Steal the VFY** tracks. Competition runs 21 Oct – 21 Nov 2026.
+Agent **Wowo** for [zkVerify Agent Games](https://agentgames.zkverify.io) — **Proof Gatekeeper** + **Steal the VFY** tracks. Competition runs 21 Oct – 21 Nov 2026.
 
 - **Proof Gatekeeper**: approve/reject proof-backed payment requests. 7 trap varieties (VK substitution, threshold mismatch, proof reuse, expired condition, recipient mismatch, amount overflow). Wrong approvals cost −6, wrong rejections −3 — so on any uncertainty the agent **fails closed (REJECT)**.
 - **Steal the VFY**: head-to-head strategy match, 20 turns, 100 VFY each. Conservative policy: FORTIFY when exposed and attacked, EXTRACT when the opponent leaves balance exposed, otherwise HOLD (always provable, never invalid).

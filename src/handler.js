@@ -21,7 +21,7 @@ const { chooseAction, validateTurn } = require('./steal');
 const { proveGatekeeper, provePolicy, PROOF_READY } = require('./proof');
 
 const SECRET = process.env.AGENT_GAMES_SECRET || '';
-const AGENT_NAME = process.env.AGENT_NAME || 'SKY-TANK';
+const AGENT_NAME = process.env.AGENT_NAME || 'Wowo';
 
 const seenProofs = new Set();
 const seenTurns = new Set();
