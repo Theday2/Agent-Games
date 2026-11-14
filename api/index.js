@@ -33,6 +33,6 @@ module.exports = async (req, res) => {
   } catch (e) {
     console.error('[error]', e);
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ matchId: '', turn: 0, action: 'HOLD' }));
+    res.end(JSON.stringify({ matchId: '', turn: 0, action: { type: 'HOLD' }, agentTimestamp: new Date().toISOString(), idempotencyKey: '' }));
   }
 };

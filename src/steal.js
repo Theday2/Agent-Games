@@ -1,91 +1,95 @@
 /**
- * Steal the VFY — strategy + turn handling.
+ * Steal the VFY — turn handling.
  *
- * Match: 20 turns, 100 VFY each, Swiss 5 rounds -> Top 16 knockout.
- * Actions: EXTRACT (free, takes a bounded amount from opponent's exposed
- * balance), FORTIFY (small fixed cost, protects part of your balance),
- * HOLD (free, no movement). Resolution is simultaneous against prior
- * public state only — never arrival order.
- * Scoring: win +18, draw +9, loss +3, reliability +0..+2,
- * timeout -1/turn, invalid proof -2/turn.
+ * Real turn envelope (agentgames.zkverify.io/build §06):
+ *   { protocolVersion:"v1", eventId:"steal-the-vfy", mode, matchId, turn,
+ *     issuedAt, deadlineAt,
+ *     state:{ selfBalance, opponentBalance,
+ *             selfFortifiedUntilTurn, opponentFortifiedUntilTurn },
+ *     strategyCommitment:{ hash }, resolverVersion, nonce }
  *
- * Policy (parameterised, conservative — a submitted-but-invalid proof is
- * -2 and a timeout is -1, so NEVER miss a turn and NEVER send an action
- * the committed strategy cannot prove):
- *   - If our exposed balance is large and the opponent extracted last
- *     turn (or is likely to), FORTIFY.
- *   - Else if the opponent's exposed balance is worth taking, EXTRACT.
- *   - Else HOLD.
- * Exact caps/costs (EXTRACT cap, FORTIFY cost, exposed fraction) come
- * from the turn envelope / docs — see README. Defaults below are the
- * documented ones where known; tune after the first practice turns.
- *
- * The platform computes publicInputsHash from the game state it knows and
- * rejects proofs whose hashes diverge — compute it from the envelope's
- * state fields in the exact documented field order (see proof.js).
+ * The decision itself lives in src/policy.js (the frozen committed
+ * policy v1). This module only validates the envelope and shapes the
+ * response. Response (200, signed):
+ *   { matchId, turn, action:{ type, amount? }, policyProof,
+ *     agentTimestamp, idempotencyKey }
+ * `action.amount` MUST be omitted for HOLD/FORTIFY. `idempotencyKey` is
+ * unique per turn. policyProof carries circuitVersion, proofReference
+ * (the vfy-policy vkHash) and publicInputsHash; the Groth16 proof +
+ * public_signals are added inside policyProof once PROOF_READY.
  */
 'use strict';
 
-const ACTIONS = { EXTRACT: 'EXTRACT', FORTIFY: 'FORTIFY', HOLD: 'HOLD' };
+const crypto = require('crypto');
+const policy = require('./policy');
 
-/**
- * Choose an action for one turn.
- * @param {object} state - game state from the turn envelope. Expected
- *   fields (names per the platform envelope; missing fields default to 0):
- *   myBalance, myExposed, opponentBalance, opponentExposed,
- *   myFortified, opponentFortified, turn, matchId,
- *   opponentLastAction (if the envelope carries history).
- * @param {object} cfg - tunables
- * @returns {{action: string, amount?: number, reason: string}}
- */
-function chooseAction(state, cfg = {}) {
-  const {
-    extractMinGain = 1,     // only EXTRACT if expected gain >= this
-    fortifyThreshold = 25,  // FORTIFY when our exposed balance >= this
-    extractThreshold = 5,   // EXTRACT when opponent exposed >= this
-  } = cfg;
-
-  const myExposed = Number(state.myExposed ?? 0);
-  const oppExposed = Number(state.opponentExposed ?? 0);
-  const turn = Number(state.turn ?? 0);
-
-  // Late match, behind on balance: take what is available.
-  // (Balance comparison needs myBalance/opponentBalance from the envelope.)
-  const myBalance = Number(state.myBalance ?? 100);
-  const oppBalance = Number(state.opponentBalance ?? 100);
-
-  // 1. Protect ourselves when we are exposed and the opponent is aggressive.
-  if (myExposed >= fortifyThreshold && state.opponentLastAction === 'EXTRACT') {
-    return { action: ACTIONS.FORTIFY, reason: 'exposed-and-opponent-extracting' };
-  }
-
-  // 2. Take value when the opponent leaves balance exposed.
-  if (oppExposed >= extractThreshold) {
-    const gain = Math.min(oppExposed, Number(cfg.extractCap ?? oppExposed));
-    if (gain >= extractMinGain) {
-      return { action: ACTIONS.EXTRACT, amount: gain, reason: 'opponent-exposed' };
-    }
-  }
-
-  // 3. Behind late in the match: extract whatever is exposed, even small.
-  if (turn >= 15 && myBalance < oppBalance && oppExposed > 0) {
-    return { action: ACTIONS.EXTRACT, amount: Math.min(oppExposed, Number(cfg.extractCap ?? oppExposed)), reason: 'behind-late' };
-  }
-
-  // 4. Default: preserve state. HOLD is always provable and never invalid.
-  return { action: ACTIONS.HOLD, reason: 'no-edge' };
-}
-
-/**
- * Validate a turn envelope minimally before acting.
- * Returns an error string, or null when the envelope looks usable.
- */
+/** Validate a turn envelope minimally before acting. Error string or null. */
 function validateTurn(envelope) {
   if (!envelope || typeof envelope !== 'object') return 'empty-envelope';
   if (!envelope.matchId) return 'missing-matchId';
   if (envelope.turn === undefined || envelope.turn === null) return 'missing-turn';
+  if (envelope.deadlineAt && Date.now() > Date.parse(envelope.deadlineAt)) return 'turn-expired';
   if (envelope.deadline && Date.now() > Date.parse(envelope.deadline)) return 'turn-expired';
   return null;
 }
 
-module.exports = { chooseAction, validateTurn, ACTIONS };
+/**
+ * Build the full signed response object for a turn.
+ * @param {object} envelope - the turn envelope
+ * @param {object} [proof] - optional { proof, publicSignals } (when PROOF_READY)
+ * @returns {object} the response body object
+ */
+function buildResponse(envelope, proof) {
+  const matchId = envelope.matchId;
+  const turn = envelope.turn;
+  const state = envelope.state || {};
+  const choice = policy.chooseAction({ ...state, turn });
+
+  const action = { type: choice.action };
+  if (choice.action === 'EXTRACT' && choice.amount !== undefined) {
+    action.amount = choice.amount;
+  }
+
+  const commitment = (envelope.strategyCommitment && envelope.strategyCommitment.hash)
+    || policy.VK_HASH;
+  const amount = action.amount ?? 0;
+  let hash;
+  try {
+    hash = policy.publicInputsHash({
+      commitment,
+      matchId,
+      turn,
+      selfBalance: state.selfBalance ?? 100,
+      opponentBalance: state.opponentBalance ?? 100,
+      action: choice.action,
+      amount,
+    });
+  } catch (e) {
+    // Malformed matchId/commitment (not a real UUID/hash) — never crash
+    // the turn over the hash; answer with a zero hash and log it.
+    console.error('[steal] publicInputsHash failed:', e.message);
+    hash = '0x' + '0'.repeat(64);
+  }
+
+  const policyProof = {
+    circuitVersion: policy.POLICY_VERSION,
+    proofReference: policy.VK_HASH,
+    publicInputsHash: hash,
+  };
+  if (proof) {
+    policyProof.proof = proof.proof;
+    policyProof.public_signals = proof.publicSignals;
+  }
+
+  return {
+    matchId,
+    turn,
+    action,
+    policyProof,
+    agentTimestamp: new Date().toISOString(),
+    idempotencyKey: crypto.randomUUID(),
+    _reason: choice.reason, // stripped before sending; kept for logs/tests
+  };
+}
+
+module.exports = { validateTurn, buildResponse, policy };

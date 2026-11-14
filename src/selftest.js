@@ -1,13 +1,12 @@
 /**
  * Self-test: spins the server on a random port and sends mock envelopes
- * (gatekeeper valid + all 7 trap varieties, steal turn) with HMAC signing.
+ * in the REAL platform formats (agentgames.zkverify.io/build):
+ *   - preflight {type:"agent-games.preflight.v1"} → {ok:true, protocolVersion:"v1"}
+ *   - gatekeeper valid + all trap varieties
+ *   - steal turns with the real state fields (selfBalance/opponentBalance/
+ *     selfFortifiedUntilTurn/opponentFortifiedUntilTurn)
  * No network, no secrets, no Kurier. Exit 0 when every case behaves as
  * the documented scoring expects.
- *
- * NOTE: on-chain verification is not wired yet, so valid tasks fail
- * closed to REJECT/UNVERIFIED in this build — the test asserts the trap
- * rejections (which do not depend on the chain) and documents the valid
- * case as pending Kurier wiring.
  */
 'use strict';
 
@@ -61,13 +60,24 @@ const baseInput = {
   amount: '500', max_transfer: '1000', proof_tx: '0xa4c1000000000000000000000000000000000000000000000000000000008ff1',
 };
 
-const cases = [
+const trapCases = [
   ['VK_SUBSTITUTION', { ...baseInput, proof_vk: '0xa4c100000000000000000000000000000000000000000000000000000000b8ff' }, 'REJECT', 'VK_SUBSTITUTION'],
   ['THRESHOLD_MISMATCH', { ...baseInput, public_balance: '999' }, 'REJECT', 'THRESHOLD_MISMATCH'],
   ['EXPIRED_CONDITION', { ...baseInput, current_block: 19842202 }, 'REJECT', 'EXPIRED_CONDITION'],
   ['RECIPIENT_MISMATCH', { ...baseInput, condition_recipient: '0xDe4200000000000000000000000000000000009999' }, 'REJECT', 'RECIPIENT_MISMATCH'],
   ['AMOUNT_OVERFLOW', { ...baseInput, amount: '1001' }, 'REJECT', 'AMOUNT_OVERFLOW'],
 ];
+
+function stealEnvelope(matchId, turn, state) {
+  return {
+    protocolVersion: 'v1', eventId: 'steal-the-vfy', mode: 'competition',
+    matchId, turn, issuedAt: new Date().toISOString(),
+    deadlineAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    state: { selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null, ...state },
+    strategyCommitment: { hash: '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047' },
+    resolverVersion: 'v1', nonce: 'test-nonce-' + turn,
+  };
+}
 
 async function main() {
   const srv = spawn('node', ['src/server.js'], {
@@ -92,34 +102,66 @@ async function main() {
     const bad = await post('/', { type: 'agent-games.proof-gatekeeper.v1', input: baseInput }, false);
     check('unsigned request rejected (401)', bad.status === 401, `status=${bad.status}`);
 
-    for (const [name, input, wantDec, wantReason] of cases) {
+    // Preflight must answer {ok:true, protocolVersion:"v1"}.
+    const pf = await post('/', { type: 'agent-games.preflight.v1', agent_id: 'agt_test', issued_at: new Date().toISOString(), nonce: 'abc123' });
+    const pfo = JSON.parse(pf.body);
+    check('preflight ok', pf.status === 200 && pfo.ok === true && pfo.protocolVersion === 'v1', pf.body);
+
+    // Valid task: all fields match → APPROVE (local checks; on-chain gate off).
+    const ok = await post('/', { type: 'agent-games.proof-gatekeeper.v1', task_id: 'gk_test_valid', input: { ...baseInput, proof_tx: '0xvalid00000000000000000000000000000000000000000000000000000001' } });
+    const oko = JSON.parse(ok.body);
+    check('gatekeeper valid → APPROVE', ok.status === 200 && oko.decision === 'APPROVE' && oko.reason_code === 'VALID_CONDITION', ok.body);
+
+    // Same proof_tx again → PROOF_REUSED (first APPROVE recorded it).
+    const re = await post('/', { type: 'agent-games.proof-gatekeeper.v1', task_id: 'gk_test_reuse', input: { ...baseInput, proof_tx: '0xvalid00000000000000000000000000000000000000000000000000000001' } });
+    const reo = JSON.parse(re.body);
+    check('gatekeeper reuse → PROOF_REUSED', reo.decision === 'REJECT' && reo.reason_code === 'PROOF_REUSED', re.body);
+
+    for (const [name, input, wantDec, wantReason] of trapCases) {
       const r = await post('/', { type: 'agent-games.proof-gatekeeper.v1', task_id: `gk_test_${name}`, input });
       const o = JSON.parse(r.body);
       check(`gatekeeper ${name}`, r.status === 200 && o.decision === wantDec && o.reason_code === wantReason, r.body);
       check(`response signed (${name})`, typeof r.sig === 'string' && r.sig.length === 64);
     }
 
-    // PROOF_REUSED: same proof_tx twice — first is fail-closed UNVERIFIED
-    // (no chain yet), second must be PROOF_REUSED only if the first was
-    // accepted; here the first is not APPROVEd so it is not recorded.
-    // We assert the second call is still a REJECT (fail closed either way).
-    const r1 = await post('/', { type: 'agent-games.proof-gatekeeper.v1', task_id: 'gk_test_reuse1', input: { ...baseInput, proof_tx: '0xreuse00000000000000000000000000000000000000000000000000000001' } });
-    const o1 = JSON.parse(r1.body);
-    check('reuse first call rejected (fail closed)', o1.decision === 'REJECT', r1.body);
-
-    // Steal: HOLD default when nothing is exposed; EXTRACT when exposed.
-    const s1 = await post('/', { matchId: 'm1', turn: 1, state: { myBalance: 100, myExposed: 0, opponentBalance: 100, opponentExposed: 0 } });
+    // Steal: real envelope shapes + committed policy v1.
+    const s1 = await post('/', stealEnvelope('9f4e1b2a-0000-4000-8000-000000000001', 1, { selfBalance: 100, opponentBalance: 100 }));
     const so1 = JSON.parse(s1.body);
-    check('steal HOLD default', s1.status === 200 && so1.action === 'HOLD' && so1.matchId === 'm1' && so1.turn === 1, s1.body);
-    check('steal HOLD has no amount field', !('amount' in so1));
+    check('steal level+rich → FORTIFY', so1.action.type === 'FORTIFY' && !('amount' in so1.action), s1.body);
+    check('steal response has policyProof+hash', typeof so1.policyProof.publicInputsHash === 'string' && /^0x[0-9a-f]{64}$/.test(so1.policyProof.publicInputsHash), s1.body);
+    check('steal response has idempotencyKey+timestamp', typeof so1.idempotencyKey === 'string' && typeof so1.agentTimestamp === 'string', s1.body);
+    check('steal response has no _reason leak', !('_reason' in so1));
 
-    const s2 = await post('/', { matchId: 'm1', turn: 2, state: { myBalance: 100, myExposed: 0, opponentBalance: 100, opponentExposed: 40 } });
+    const s2 = await post('/', stealEnvelope('9f4e1b2a-0000-4000-8000-000000000001', 2, { selfBalance: 80, opponentBalance: 100 }));
     const so2 = JSON.parse(s2.body);
-    check('steal EXTRACT when exposed', so2.action === 'EXTRACT' && so2.amount === 40, s2.body);
+    check('steal behind → EXTRACT 5', so2.action.type === 'EXTRACT' && so2.action.amount === 5, s2.body);
 
-    const s3 = await post('/', { matchId: 'm1', turn: 3, state: { myBalance: 100, myExposed: 30, opponentBalance: 100, opponentExposed: 0, opponentLastAction: 'EXTRACT' } });
+    const s3 = await post('/', stealEnvelope('9f4e1b2a-0000-4000-8000-000000000002', 1, { selfBalance: 100, opponentBalance: 100, opponentFortifiedUntilTurn: 5 }));
     const so3 = JSON.parse(s3.body);
-    check('steal FORTIFY when exposed+attacked', so3.action === 'FORTIFY', s3.body);
+    check('steal opponent fortified → FORTIFY (protect)', so3.action.type === 'FORTIFY', s3.body);
+
+    const s4 = await post('/', stealEnvelope('9f4e1b2a-0000-4000-8000-000000000003', 18, { selfBalance: 100, opponentBalance: 100 }));
+    const so4 = JSON.parse(s4.body);
+    check('steal late game → EXTRACT', so4.action.type === 'EXTRACT' && so4.action.amount === 5, s4.body);
+
+    const s5 = await post('/', stealEnvelope('9f4e1b2a-0000-4000-8000-000000000004', 3, { selfBalance: 40, opponentBalance: 40 }));
+    const so5 = JSON.parse(s5.body);
+    check('steal poor balance → EXTRACT', so5.action.type === 'EXTRACT', s5.body);
+
+    // publicInputsHash is deterministic per turn inputs (unit-level check:
+    // re-sending the same turn would hit the duplicate guard, so call the
+    // policy function directly twice).
+    const { publicInputsHash } = require('./policy');
+    const hashInput = {
+      commitment: '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047',
+      matchId: '9f4e1b2a-0000-4000-8000-000000000001', turn: 1,
+      selfBalance: 100, opponentBalance: 100, action: 'FORTIFY', amount: 0,
+    };
+    const h1 = so1.policyProof.publicInputsHash;
+    const h1b = publicInputsHash(hashInput);
+    check('publicInputsHash deterministic', h1 === h1b, `${h1} vs ${h1b}`);
+    check('publicInputsHash changes with turn', h1 !== publicInputsHash({ ...hashInput, turn: 2 }));
+    check('publicInputsHash changes with action', h1 !== publicInputsHash({ ...hashInput, action: 'EXTRACT', amount: 5 }));
   } finally {
     srv.kill('SIGTERM');
   }

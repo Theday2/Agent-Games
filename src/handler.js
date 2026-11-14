@@ -1,5 +1,5 @@
 /**
- * Shared request handler for sky-agent-games.
+ * Shared request handler for Wowo (zkVerify Agent Games).
  * Used by both the long-running server (src/server.js) and the Vercel
  * serverless function (api/index.js). Pure logic — no HTTP server here.
  *
@@ -17,8 +17,9 @@
 
 const crypto = require('crypto');
 const { decide } = require('./gatekeeper');
-const { chooseAction, validateTurn } = require('./steal');
+const { validateTurn, buildResponse } = require('./steal');
 const { proveGatekeeper, provePolicy, PROOF_READY } = require('./proof');
+const { submitProof, waitFinalized } = require('./kurier');
 
 const SECRET = process.env.AGENT_GAMES_SECRET || '';
 const AGENT_NAME = process.env.AGENT_NAME || 'Wowo';
@@ -53,13 +54,18 @@ function signResponse(rawBody) {
   return hmacHex(SECRET, rawBody);
 }
 
+async function handlePreflight() {
+  // The platform sends {type:"agent-games.preflight.v1", agent_id, ...}
+  // before marking the agent active. Must answer {ok:true, protocolVersion:"v1"}.
+  return { ok: true, protocolVersion: 'v1' };
+}
+
 async function handleGatekeeper(envelope) {
   const input = envelope.input || {};
   const taskId = envelope.task_id || envelope.taskId || '';
-  // TODO(kurier): verify proof_tx on-chain before approving. Until then
-  // we fail closed (REJECT/UNVERIFIED) — never let a trap through.
-  const onChainVerified = false;
-  const result = decide(input, { seenProofs, onChainVerified });
+  // Local checks decide; on-chain verification is re-enabled once the
+  // Kurier proof path is wired (see gatekeeper.js for the trade-off).
+  const result = decide(input, { seenProofs, requireOnChain: false });
   if (result.decision === 'APPROVE') seenProofs.add(result.proof_tx);
 
   const response = {
@@ -68,6 +74,9 @@ async function handleGatekeeper(envelope) {
     proof_tx: result.proof_tx,
   };
 
+  // Attach a Groth16 proof when the schema is ready; without it a
+  // correct decision still scores but loses the reliability bonus (-2).
+  // The proof is also submitted to Kurier until Finalized.
   if (PROOF_READY) {
     try {
       const p = await proveGatekeeper(input, result);
@@ -75,8 +84,10 @@ async function handleGatekeeper(envelope) {
       response.public_signals = p.publicSignals;
       response.circuitVersion = p.circuitVersion;
       response.vkHash = p.vkHash;
+      const job = await submitProof({ proof: p.proof, publicSignals: p.publicSignals, vkHash: p.vkHash });
+      await waitFinalized(job.jobId);
     } catch (e) {
-      console.error('[gatekeeper] proof failed:', e.message);
+      console.error('[gatekeeper] proof/kurier failed:', e.message);
     }
   }
   console.log(`[gatekeeper] ${taskId} -> ${result.decision} ${result.reason_code}`);
@@ -88,34 +99,46 @@ async function handleSteal(envelope) {
   const matchId = envelope.matchId || envelope.match_id || '';
   const turn = envelope.turn;
   if (err) {
+    // Fail closed: HOLD is always provable and never invalid.
     console.warn(`[steal] invalid turn envelope (${err}) — answering HOLD`);
-    return { matchId, turn, action: 'HOLD' };
+    return {
+      matchId, turn,
+      action: { type: 'HOLD' },
+      policyProof: { circuitVersion: 'v1', proofReference: '', publicInputsHash: '' },
+      agentTimestamp: new Date().toISOString(),
+      idempotencyKey: crypto.randomUUID(),
+    };
   }
   const key = `${matchId}:${turn}`;
   if (seenTurns.has(key)) {
     console.warn(`[steal] duplicate turn ${key} — answering HOLD`);
-    return { matchId, turn, action: 'HOLD' };
+    return {
+      matchId, turn,
+      action: { type: 'HOLD' },
+      policyProof: { circuitVersion: 'v1', proofReference: '', publicInputsHash: '' },
+      agentTimestamp: new Date().toISOString(),
+      idempotencyKey: crypto.randomUUID(),
+    };
   }
   seenTurns.add(key);
 
-  const state = envelope.state || envelope.gameState || envelope;
-  const choice = chooseAction(state);
-  const response = { matchId, turn, action: choice.action };
-  if (choice.action === 'EXTRACT' && choice.amount !== undefined) {
-    response.amount = choice.amount;
-  }
-
+  let proof;
   if (PROOF_READY) {
     try {
-      const p = await provePolicy(envelope, choice);
-      response.policyProof = { circuitVersion: p.circuitVersion, proof: p.proof, public_signals: p.publicSignals };
-      response.proofReference = p.vkHash;
+      const p = await provePolicy(envelope, null);
+      proof = { proof: p.proof, publicSignals: p.publicSignals };
+      const job = await submitProof({ proof: p.proof, publicSignals: p.publicSignals, vkHash: p.vkHash });
+      await waitFinalized(job.jobId);
     } catch (e) {
       console.error('[steal] policy proof failed:', e.message);
     }
   }
-  console.log(`[steal] ${key} -> ${choice.action} (${choice.reason})`);
-  return response;
+
+  const out = buildResponse(envelope, proof);
+  const reason = out._reason;
+  delete out._reason;
+  console.log(`[steal] ${key} -> ${out.action.type} (${reason})`);
+  return out;
 }
 
 async function handleRequest(req) {
@@ -159,15 +182,23 @@ async function handleRequest(req) {
 
   const type = String(envelope.type || '');
   let out;
-  if (type.includes('proof-gatekeeper') || envelope.input) {
+  if (type.includes('preflight')) {
+    out = await handlePreflight();
+    console.log(`[preflight] ok ${Date.now() - started}ms`);
+  } else if (type.includes('proof-gatekeeper') || envelope.input) {
     out = await handleGatekeeper(envelope);
     console.log(`[gatekeeper] ${Date.now() - started}ms`);
-  } else if (type.includes('steal') || type.includes('vfy') || envelope.matchId || envelope.match_id) {
+  } else if (type.includes('steal') || envelope.eventId === 'steal-the-vfy' || envelope.matchId || envelope.match_id) {
     out = await handleSteal(envelope);
     console.log(`[steal] ${Date.now() - started}ms`);
   } else {
     console.warn('[warn] unknown envelope type:', type);
-    out = { matchId: envelope.matchId || '', turn: envelope.turn ?? 0, action: 'HOLD' };
+    out = {
+      matchId: envelope.matchId || '', turn: envelope.turn ?? 0,
+      action: { type: 'HOLD' },
+      agentTimestamp: new Date().toISOString(),
+      idempotencyKey: crypto.randomUUID(),
+    };
   }
   return json(200, out);
 }

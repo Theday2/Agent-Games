@@ -34,7 +34,7 @@ const server = http.createServer(async (req, res) => {
     console.error('[error]', e);
     try {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ matchId: '', turn: 0, action: 'HOLD' }));
+      res.end(JSON.stringify({ matchId: '', turn: 0, action: { type: 'HOLD' }, agentTimestamp: new Date().toISOString(), idempotencyKey: '' }));
     } catch { /* socket gone */ }
   }
 });

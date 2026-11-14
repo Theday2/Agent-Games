@@ -1,54 +1,84 @@
 /**
- * Kurier client (zkVerify proof submission).
+ * Kurier client (zkVerify proof submission) — mainnet, RECOMMENDED by
+ * https://agentgames.zkverify.io/build.
  *
- * Flow (from https://agentgames.zkverify.io/build):
- *   1. Get a mainnet API key.
- *   2. Register the verification key once (submit with its vk hash).
- *   3. Submit proofs with the vk hash.
- *   4. Poll until the job reaches Finalized.
- * Job states: Submitted -> IncludedInBlock -> Finalized.
+ * Signup (FREE, email): https://kurier.xyz → generate API key → save as
+ * KURIER_API_KEY in .env (never commit it, never log it). The key goes in
+ * the URL PATH of every request (not a header).
  *
- * STATUS: endpoint paths + auth scheme are NOT published on the build
- * page. Fill in KURIER_BASE + the request shapes once the Kurier docs
- * (docs.zkverify.io / kurier.network) are confirmed. Until then every
- * method throws a clear error and the server fails closed.
+ * Base URL: https://api.kurier.xyz/api/v1
+ *   POST /register-vk/{apiKey}     — once per verification key
+ *   POST /submit-proof/{apiKey}    — submit a Groth16 proof
+ *   GET  /job-status/{apiKey}/{jobId} — poll until Finalized
+ * Job states: Queued → Valid → Submitted → IncludedInBlock → Finalized
+ * (or Failed).
  *
- * Env: KURIER_API_KEY (never commit it; never log it).
+ * For Agent Games the circuit VKs are ALREADY registered on mainnet, so
+ * submit with vkRegistered: true + the published vkHash — no register-vk
+ * call is needed.
+ *
+ * Env: KURIER_API_KEY (required), KURIER_BASE (default mainnet above).
+ * Uses global fetch (Node 20+). On this VM, start the server with
+ * NODE_USE_ENV_PROXY=1 so fetch goes through the egress proxy; on
+ * Vercel no proxy is needed.
  */
 'use strict';
 
-const KURIER_BASE = process.env.KURIER_BASE || 'https://api.kurier.network';
+const KURIER_BASE = (process.env.KURIER_BASE || 'https://api.kurier.xyz/api/v1').replace(/\/$/, '');
 const API_KEY = process.env.KURIER_API_KEY || '';
 
-function notReady(what) {
-  return new Error(`kurier not ready: ${what} — see src/kurier.js header`);
+function needKey() {
+  if (!API_KEY) throw new Error('KURIER_API_KEY is not set — sign up free at https://kurier.xyz');
 }
 
 async function api(path, method, body) {
-  if (!API_KEY) throw notReady('KURIER_API_KEY is not set');
-  throw notReady(`endpoint ${method} ${path} is not confirmed yet`);
+  needKey();
+  const url = `${KURIER_BASE}${path}/${API_KEY}`;
+  const res = await fetch(url, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok) {
+    throw new Error(`kurier ${method} ${path} → HTTP ${res.status}: ${JSON.stringify(data).slice(0, 300)}`);
+  }
+  return data;
 }
 
 /** Register a verification key once (idempotent per vk hash). */
-async function registerVk(vkHash) {
-  return api('/v1/vk', 'POST', { vkHash });
+async function registerVk(vk) {
+  return api('/register-vk', 'POST', {
+    proofType: 'groth16',
+    proofOptions: { library: 'snarkjs', curve: 'bn128' },
+    vk,
+  });
 }
 
 /**
- * Submit a Groth16 proof. Returns the Kurier job id.
- * @param {{vkHash: string, proof: object, publicSignals: string[]}} p
+ * Submit a Groth16 proof. Returns { jobId, optimisticVerify, ... }.
+ * @param {{proof: object, publicSignals: string[], vkHash: string}} p
  */
 async function submitProof(p) {
-  return api('/v1/proofs', 'POST', p);
+  return api('/submit-proof', 'POST', {
+    proofType: 'groth16',
+    vkRegistered: true,
+    proofOptions: { library: 'snarkjs', curve: 'bn128' },
+    proofData: { proof: p.proof, publicSignals: p.publicSignals, vk: p.vkHash },
+  });
 }
 
-/** Poll a job until Finalized (or timeout). Returns the final job object. */
-async function waitFinalized(jobId, { timeoutMs = 120000, intervalMs = 5000 } = {}) {
+/** Poll a job until Finalized (or Failed/timeout). Returns the final job object. */
+async function waitFinalized(jobId, { timeoutMs = 180000, intervalMs = 5000 } = {}) {
   const started = Date.now();
   for (;;) {
-    const job = await api(`/v1/proofs/${jobId}`, 'GET');
-    if (job && (job.status === 'Finalized' || job.state === 'Finalized')) return job;
-    if (Date.now() - started > timeoutMs) throw new Error(`kurier job ${jobId} did not finalize in ${timeoutMs}ms`);
+    const job = await api(`/job-status/${jobId}`, 'GET');
+    const status = job.status || job.state;
+    if (status === 'Finalized') return job;
+    if (status === 'Failed') throw new Error(`kurier job ${jobId} Failed: ${JSON.stringify(job).slice(0, 300)}`);
+    if (Date.now() - started > timeoutMs) throw new Error(`kurier job ${jobId} did not finalize in ${timeoutMs}ms (last: ${status})`);
     await new Promise((r) => setTimeout(r, intervalMs));
   }
 }
